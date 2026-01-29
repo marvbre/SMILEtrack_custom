@@ -9,16 +9,18 @@ from tracker.basetrack import BaseTrack, TrackState
 from tracker.kalman_filter import KalmanFilter
 
 # from fast_reid.fast_reid_interfece import FastReIDInterface
+#test
 from .SLM import load_model
 import torch
+
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
 
-    def __init__(self, tlwh, score, cls, feat=None, feat_history=50):
+    def __init__(self, tlwh, score, cls, feat=None, pose=None, feat_history=50): #STrack(STrack.tlbr_to_tlwh(tlbr), s, c, None, p)
 
         # wait activate
-        self._tlwh = np.asarray(tlwh, dtype=np.float)
+        self._tlwh = np.asarray(tlwh, dtype=float)
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
@@ -36,6 +38,14 @@ class STrack(BaseTrack):
             self.update_features(feat)
         self.features = deque([], maxlen=feat_history)
         self.alpha = 0.9
+
+        self.pose = pose
+        self.curr_pose = None
+        if pose is not None:
+            self.update_pose(pose)
+
+    def update_pose(self, pose):
+        self.curr_pose = pose
 
     def update_features(self, feat):
         feat /= np.linalg.norm(feat)
@@ -125,6 +135,8 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance, self.tlwh_to_xywh(new_track.tlwh))
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
+        if new_track.curr_pose is not None:
+            self.update_pose(new_track.curr_pose)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -152,6 +164,9 @@ class STrack(BaseTrack):
 
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
+        
+        if new_track.curr_pose is not None:
+            self.update_pose(new_track.curr_pose)
 
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -186,6 +201,11 @@ class STrack(BaseTrack):
         """
         ret = self.tlwh.copy()
         ret[:2] += ret[2:] / 2.0
+        return ret
+    
+    @property
+    def skeleton(self):
+        ret = np.asarray(self.curr_pose).copy()
         return ret
 
     @staticmethod
@@ -226,7 +246,7 @@ class STrack(BaseTrack):
         return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame, self.end_frame)
     
 def extract_image_patches(image, bboxes):
-    bboxes = np.round(bboxes).astype(np.int)     
+    bboxes = np.round(bboxes).astype(int)     
     patches = [image[box[1]:box[3], box[0]:box[2],:] for box in bboxes]    
     #bboxes = clip_boxes(bboxes, image.shape)
     return patches
@@ -256,7 +276,7 @@ class SMILEtrack(object):
 
         if args.with_reid:
             #self.encoder = FastReIDInterface(args.fast_reid_config, args.fast_reid_weights, args.device)
-            self.weight_path = "./pretrained/ver12.pt"
+            self.weight_path = args.fast_reid_weights
             self.encoder = load_model(self.weight_path)
             self.encoder = self.encoder.cuda()
             self.encoder = self.encoder.eval() 
@@ -264,7 +284,7 @@ class SMILEtrack(object):
 
         self.gmc = GMC(method=args.cmc_method, verbose=[args.name, args.ablation])
 
-    def update(self, output_results, img):
+    def update(self, output_results, output_poses, img):
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
@@ -276,6 +296,7 @@ class SMILEtrack(object):
             scores = output_results[:, 4]
             classes = output_results[:, 5]
             features = output_results[:, 6:]
+            keypoints = output_poses
 
             # Remove bad detections
             lowest_inds = scores > self.track_low_thresh
@@ -283,6 +304,7 @@ class SMILEtrack(object):
             scores = scores[lowest_inds]
             classes = classes[lowest_inds]
             features = output_results[lowest_inds]
+            keypoints = output_poses[lowest_inds]
 
             # Find high threshold detections
             remain_inds = scores > self.args.track_high_thresh
@@ -290,6 +312,17 @@ class SMILEtrack(object):
             scores_keep = scores[remain_inds]
             classes_keep = classes[remain_inds]
             features_keep = features[remain_inds]
+            
+            try:
+                keypoints_keep = output_poses[remain_inds]
+            except Exception as e:
+                print(output_poses.shape, "vs ", remain_inds.shape)
+                while(len(remain_inds) < output_poses.shape[0]):
+                    remain_inds = list(remain_inds)
+                    remain_inds.append(False)
+                    remain_inds = np.array(remain_inds)
+                keypoints_keep = output_poses[remain_inds]
+  
         else:
             bboxes = []
             scores = []
@@ -297,6 +330,7 @@ class SMILEtrack(object):
             dets = []
             scores_keep = []
             classes_keep = []
+            keypoints_keep = []
     
         '''Extract embeddings '''
         if self.args.with_reid:
@@ -319,11 +353,9 @@ class SMILEtrack(object):
         if len(dets) > 0:
             '''Detections'''
             if self.args.with_reid:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c, f) for
-                              (tlbr, s, c, f) in zip(dets, scores_keep, classes_keep, features_keep)]
+                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c, f) for (tlbr, s, c, f) in zip(dets, scores_keep, classes_keep, features_keep)]
             else:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c) for
-                              (tlbr, s, c) in zip(dets, scores_keep, classes_keep)]
+                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, c, None, p) for (tlbr, s, c, p) in zip(dets, scores_keep, classes_keep, keypoints_keep)]
         else:
             detections = []
 
